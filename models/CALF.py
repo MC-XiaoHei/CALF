@@ -63,6 +63,10 @@ class Model(nn.Module):
         # Create Powerformer version with same config
         self.gpt2 = PowerformerAccustumGPT2Model(base_gpt2_time.config, alpha=alpha)
         
+        # Truncate to the required number of layers BEFORE copying weights
+        self.gpt2.h = self.gpt2.h[:configs.gpt_layers]
+        base_gpt2_time.h = base_gpt2_time.h[:configs.gpt_layers]
+        
         # Copy pretrained weights from base model (except attention layers which are replaced)
         self.gpt2.wte = base_gpt2_time.wte
         self.gpt2.wpe = base_gpt2_time.wpe
@@ -73,15 +77,16 @@ class Model(nn.Module):
         for i, (new_block, old_block) in enumerate(zip(self.gpt2.h, base_gpt2_time.h)):
             new_block.ln_1.load_state_dict(old_block.ln_1.state_dict())
             new_block.ln_2.load_state_dict(old_block.ln_2.state_dict())
+            # Copy MLP weights (old_block.mlp is a GPT2MLP module with c_fc and c_proj attributes)
             new_block.mlp['c_fc'].load_state_dict(old_block.mlp.c_fc.state_dict())
             new_block.mlp['c_proj'].load_state_dict(old_block.mlp.c_proj.state_dict())
             # Note: WCMHA attention layers are randomly initialized (will be fine-tuned)
         
         # Use standard GPT2 for text branch
         self.gpt2_text = AccustumGPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True)
-
-        self.gpt2.h = self.gpt2.h[:configs.gpt_layers]
         self.gpt2_text.h = self.gpt2_text.h[:configs.gpt_layers]
+        
+        # Apply PEFT (LoRA) to the time branch
         self.gpt2 = get_peft_model(self.gpt2, peft_config)
         
         word_embedding = torch.tensor(torch.load(configs.word_embedding_path)).to(device=device)

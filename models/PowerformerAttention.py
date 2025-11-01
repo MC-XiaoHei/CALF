@@ -64,25 +64,29 @@ class WeightedCausalMultiheadAttention(nn.Module):
             Mask tensor of shape (seq_len, seq_len)
         """
         # Create time difference matrix: delta_t[i,j] = i - j
-        positions = torch.arange(seq_len, device=device, dtype=dtype)
+        # Use float for intermediate calculations to avoid dtype issues
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
         delta_t = positions.unsqueeze(0) - positions.unsqueeze(1)  # (seq_len, seq_len)
         
-        # Initialize mask
-        mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
+        # Initialize mask with zeros
+        mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.float32)
         
         # For non-causal connections (delta_t < 0, i.e., future attending to current/past)
         # Set to -inf so attention weight becomes 0
         mask = mask.masked_fill(delta_t < 0, float('-inf'))
         
-        # For causal connections (delta_t >= 0), apply power-law decay: -alpha * log(delta_t)
-        # Note: delta_t = 0 (self-attention) should have no penalty
+        # For causal connections (delta_t >= 0), apply power-law decay: -alpha * log(delta_t + 1)
+        # Note: delta_t = 0 (self-attention) should have no penalty (log(1) = 0)
         # For delta_t > 0, apply the power-law decay
         causal_mask = delta_t > 0
         if causal_mask.any():
-            # Add small epsilon to avoid log(0), then apply power-law decay
-            log_delta_t = torch.log(delta_t.float() + 1.0)  # log(delta_t + 1) to handle delta_t=0
+            # Use log(delta_t + 1) to handle delta_t=0 case (log(1) = 0, no penalty for self-attention)
+            log_delta_t = torch.log(delta_t + 1.0)
             power_law_penalty = -self.alpha * log_delta_t
-            mask = torch.where(causal_mask, power_law_penalty.to(dtype), mask)
+            mask = torch.where(causal_mask, power_law_penalty, mask)
+        
+        # Convert to target dtype
+        return mask.to(dtype)
         
         return mask
     
