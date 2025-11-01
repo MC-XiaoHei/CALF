@@ -1,0 +1,1025 @@
+diff --git a/POWERFORMER_WCMHA_IMPLEMENTATION.md b/POWERFORMER_WCMHA_IMPLEMENTATION.md
+new file mode 100644
+index 0000000..eaf340a
+--- /dev/null
++++ b/POWERFORMER_WCMHA_IMPLEMENTATION.md
+@@ -0,0 +1,222 @@
++# Powerformer WCMHA Implementation for CALF
++
++## Overview
++
++This implementation adds Powerformer's Weighted Causal Multihead Attention (WCMHA) to the CALF model's time series branch to address the "global reverberation" issue in standard self-attention mechanisms.
++
++## Problem Statement
++
++Time series data follows different generation patterns than natural language:
++
++1. **Causality**: Past influences future, but future cannot influence past (unidirectional time flow)
++2. **Temporal Locality/Decaying Influence**: Recent events have stronger impact; distant past events have decaying influence
++
++Standard self-attention violates these principles by:
++- Allowing bidirectional information flow (violates causality)
++- Giving equal initial attention to all time distances (violates locality)
++
++## Solution: Powerformer's WCMHA
++
++WCMHA modifies attention scores with a carefully designed mask:
++
++- **Non-causal connections** (future → past): mask = -∞ → attention weight = 0
++- **Causal connections** (past → future): mask = -α·log(Δt) where:
++  - Δt = time difference between query and key
++  - α = hyperparameter controlling decay speed
++
++The power-law decay provides:
++- Strong "focus on recent" inductive bias
++- Preservation of ability to capture important long-term dependencies
++- Better match to real-world time series characteristics
++
++## Files Modified/Created
++
++### 1. `/models/PowerformerAttention.py` (NEW)
++Implements the core WCMHA mechanism:
++
++```python
++class WeightedCausalMultiheadAttention(nn.Module):
++    """
++    Implements power-law decay attention for time series.
++    
++    Key features:
++    - Causal masking: future cannot attend to past
++    - Power-law decay: -α·log(Δt + 1) for causal connections
++    - Compatible with GPT2 attention interface
++    """
++```
++
++**Key Methods:**
++- `_create_power_law_mask()`: Creates the power-law decay mask
++- `forward()`: Applies WCMHA with proper caching support
++
++**Dimension Handling:**
++- Input: (batch, seq_len, embed_dim)
++- Output: (batch, seq_len, embed_dim)
++- Attention weights: (batch, num_heads, seq_len, seq_len)
++- Proper handling of cached keys/values for generation
++
++### 2. `/models/PowerformerGPT2.py` (NEW)
++Provides GPT2 blocks that use WCMHA:
++
++```python
++class PowerformerGPT2Attention(nn.Module):
++    """Drop-in replacement for GPT2Attention using WCMHA"""
++
++class PowerformerGPT2Block(nn.Module):
++    """GPT2 block with WCMHA attention"""
++
++class PowerformerGPT2Model(GPT2Model):
++    """Full GPT2 model using Powerformer blocks"""
++```
++
++**Architecture:**
++- Replaces standard self-attention with WCMHA
++- Preserves layer norms and MLP structures
++- Compatible with PEFT/LoRA fine-tuning
++
++### 3. `/models/GPT2_arch.py` (MODIFIED)
++Added `PowerformerAccustumGPT2Model` class:
++
++```python
++class PowerformerAccustumGPT2Model(GPT2Model):
++    """
++    Custom GPT2 model with Powerformer's WCMHA for time series.
++    Includes custom forward pass compatible with CALF architecture.
++    """
++```
++
++**Changes:**
++- Imports `PowerformerGPT2Block`
++- Implements full forward pass with WCMHA blocks
++- Maintains compatibility with original `AccustumGPT2Model` interface
++
++### 4. `/models/CALF.py` (MODIFIED)
++Updated to use WCMHA for time branch:
++
++```python
++class Model(nn.Module):
++    def __init__(self, configs, device):
++        # ...
++        
++        # NEW: Get alpha parameter from configs
++        alpha = getattr(configs, 'powerformer_alpha', 1.0)
++        
++        # NEW: Use PowerformerAccustumGPT2Model for time branch
++        base_gpt2_time = AccustumGPT2Model.from_pretrained('gpt2', ...)
++        self.gpt2 = PowerformerAccustumGPT2Model(base_gpt2_time.config, alpha=alpha)
++        
++        # Copy pretrained weights (except attention)
++        # ... weight copying logic ...
++        
++        # Text branch uses standard GPT2 (unchanged)
++        self.gpt2_text = AccustumGPT2Model.from_pretrained('gpt2', ...)
++```
++
++**Key Changes:**
++1. Added import: `PowerformerAccustumGPT2Model`
++2. Added alpha parameter support via `configs.powerformer_alpha`
++3. Time branch (`self.gpt2`) now uses WCMHA
++4. Text branch (`self.gpt2_text`) remains unchanged
++5. Proper weight initialization from pretrained GPT2:
++   - Token/position embeddings copied
++   - Layer norms copied
++   - MLP weights copied
++   - WCMHA attention randomly initialized (will be fine-tuned)
++
++## Configuration Parameter
++
++Add to your config file:
++
++```python
++powerformer_alpha = 1.0  # Power-law decay parameter
++```
++
++**Typical values:**
++- `alpha = 0.5`: Weak decay (more long-term dependencies)
++- `alpha = 1.0`: Moderate decay (default, balanced)
++- `alpha = 2.0`: Strong decay (focus on recent)
++
++## Dimension Safety
++
++All implementations include careful dimension handling to avoid errors:
++
++1. **Mask Creation:**
++   - Uses `torch.float32` for intermediate calculations
++   - Converts to target dtype only at the end
++   - Properly handles log(0) with `log(Δt + 1)`
++
++2. **Attention Computation:**
++   - Proper splitting/merging of attention heads
++   - Correct broadcasting of masks across batches and heads
++   - Cache-aware mask slicing for generation
++
++3. **NoneType Safety:**
++   - All optional parameters checked before use
++   - Proper default values for `layer_past`, `attention_mask`, `head_mask`
++
++## Testing Recommendations
++
++1. **Basic Forward Pass:**
++   ```python
++   model = Model(configs, device)
++   x = torch.randn(batch_size, seq_len, enc_in)
++   output = model(x)
++   ```
++
++2. **Check Dimensions:**
++   - Verify output shapes match expected dimensions
++   - Test with various batch sizes and sequence lengths
++
++3. **Verify Causality:**
++   - Extract attention weights with `output_attentions=True`
++   - Verify upper triangle is near-zero (causal masking)
++
++4. **Power-law Decay:**
++   - Extract attention weights
++   - Verify decay pattern: stronger attention to recent tokens
++
++## Expected Benefits
++
++1. **Better Generalization:** Model learns appropriate temporal inductive bias
++2. **Data Efficiency:** Requires less data to learn time series patterns
++3. **Robustness:** Less prone to spurious long-distance correlations
++4. **Physical Intuition:** Matches real-world time series characteristics
++
++## Backward Compatibility
++
++- Text branch remains unchanged (standard GPT2)
++- All existing functionality preserved
++- Only time branch uses WCMHA
++- Compatible with existing training scripts
++- Works with PEFT/LoRA fine-tuning
++
++## Implementation Notes
++
++1. **Weight Initialization:**
++   - WCMHA attention weights are randomly initialized
++   - Other components (embeddings, norms, MLPs) copied from pretrained GPT2
++   - This is intentional: WCMHA needs to learn power-law patterns
++
++2. **PEFT/LoRA Compatibility:**
++   - LoRA applied AFTER creating Powerformer model
++   - Target modules include WCMHA's `c_attn` projection
++   - Fine-tuning will adapt WCMHA to specific time series patterns
++
++3. **Gradient Flow:**
++   - Only specific parameters trainable (controlled by existing logic)
++   - WCMHA parameters included in trainable set via LoRA
++
++## Future Improvements
++
++Potential enhancements:
++1. Learnable alpha parameter (per-layer or per-head)
++2. Different decay functions (exponential, polynomial)
++3. Adaptive decay based on data characteristics
++4. Cross-attention with power-law decay
++
++## References
++
++- Powerformer paper: [Add reference if available]
++- Original CALF implementation
++- GPT2 architecture (Hugging Face transformers)
+diff --git a/models/CALF.py b/models/CALF.py
+index 55378bb..130bf11 100644
+--- a/models/CALF.py
++++ b/models/CALF.py
+@@ -1,8 +1,8 @@
+ import torch
+ import torch.nn as nn
+ from einops import rearrange
+-from peft import LoraConfig, TaskType
+-from models.GPT2_arch import AccustumGPT2Model
++from peft import LoraConfig, TaskType, get_peft_model
++from models.GPT2_arch import AccustumGPT2Model, PowerformerAccustumGPT2Model
+ 
+ class Encoder_PCA(nn.Module):
+     def __init__(self, input_dim, word_embedding, hidden_dim=768, num_heads=12, num_encoder_layers=1):
+@@ -42,6 +42,9 @@ class Model(nn.Module):
+         super(Model, self).__init__()
+         self.pred_len = configs.pred_len
+         
++        # Get alpha parameter from configs, default to 1.0 if not specified
++        alpha = getattr(configs, 'powerformer_alpha', 1.0)
++        
+         peft_config = LoraConfig(
+             task_type=TaskType.CAUSAL_LM, 
+             inference_mode=False, 
+@@ -53,11 +56,37 @@ class Model(nn.Module):
+     
+         self.task_name = configs.task_name
+     
+-        self.gpt2 = AccustumGPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True)  # loads a pretrained GPT-2 base model
+-        self.gpt2_text = AccustumGPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True)  # loads a pretrained GPT-2 base model
+-
++        # Use PowerformerAccustumGPT2Model for time branch (with WCMHA)
++        # Load pretrained GPT2 first, then convert to Powerformer
++        base_gpt2_time = AccustumGPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True)
++        
++        # Create Powerformer version with same config
++        self.gpt2 = PowerformerAccustumGPT2Model(base_gpt2_time.config, alpha=alpha)
++        
++        # Truncate to the required number of layers BEFORE copying weights
+         self.gpt2.h = self.gpt2.h[:configs.gpt_layers]
++        base_gpt2_time.h = base_gpt2_time.h[:configs.gpt_layers]
++        
++        # Copy pretrained weights from base model (except attention layers which are replaced)
++        self.gpt2.wte = base_gpt2_time.wte
++        self.gpt2.wpe = base_gpt2_time.wpe
++        self.gpt2.drop = base_gpt2_time.drop
++        self.gpt2.ln_f = base_gpt2_time.ln_f
++        
++        # Copy layer norms and MLPs from pretrained blocks, but attention is new WCMHA
++        for i, (new_block, old_block) in enumerate(zip(self.gpt2.h, base_gpt2_time.h)):
++            new_block.ln_1.load_state_dict(old_block.ln_1.state_dict())
++            new_block.ln_2.load_state_dict(old_block.ln_2.state_dict())
++            # Copy MLP weights (old_block.mlp is a GPT2MLP module with c_fc and c_proj attributes)
++            new_block.mlp['c_fc'].load_state_dict(old_block.mlp.c_fc.state_dict())
++            new_block.mlp['c_proj'].load_state_dict(old_block.mlp.c_proj.state_dict())
++            # Note: WCMHA attention layers are randomly initialized (will be fine-tuned)
++        
++        # Use standard GPT2 for text branch
++        self.gpt2_text = AccustumGPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True)
+         self.gpt2_text.h = self.gpt2_text.h[:configs.gpt_layers]
++        
++        # Apply PEFT (LoRA) to the time branch
+         self.gpt2 = get_peft_model(self.gpt2, peft_config)
+         
+         word_embedding = torch.tensor(torch.load(configs.word_embedding_path)).to(device=device)
+diff --git a/models/GPT2_arch.py b/models/GPT2_arch.py
+index 5371dd6..547ad43 100644
+--- a/models/GPT2_arch.py
++++ b/models/GPT2_arch.py
+@@ -2,6 +2,7 @@ import torch
+ from transformers.models.gpt2.modeling_gpt2 import GPT2Model
+ from typing import Optional, Tuple, Union
+ from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
++from models.PowerformerGPT2 import PowerformerGPT2Block
+ 
+ 
+ class AccustumGPT2Model(GPT2Model):
+@@ -203,7 +204,221 @@ class AccustumGPT2Model(GPT2Model):
+         return outputs.last_hidden_state, outputs.hidden_states # final feat, intermidiate feat
+ 
+ 
++class PowerformerAccustumGPT2Model(GPT2Model):
++    """
++    Custom GPT2 model with Powerformer's WCMHA for time series.
++    This replaces standard attention blocks with power-law decay attention.
++    """
++    
++    def __init__(self, config, alpha: float = 1.0):
++        super().__init__(config)
++        self.alpha = alpha
++        
++        # Replace standard blocks with Powerformer blocks
++        import torch.nn as nn
++        self.h = nn.ModuleList([
++            PowerformerGPT2Block(config, alpha=alpha, layer_idx=i)
++            for i in range(config.num_hidden_layers)
++        ])
++        
++        # Re-initialize weights
++        self.post_init()
++    
++    def accustum_forward(
++        self,
++        input_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
++        attention_mask: Optional[torch.FloatTensor] = None,
++        token_type_ids: Optional[torch.LongTensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        head_mask: Optional[torch.FloatTensor] = None,
++        inputs_embeds: Optional[torch.FloatTensor] = None,
++        encoder_hidden_states: Optional[torch.Tensor] = None,
++        encoder_attention_mask: Optional[torch.FloatTensor] = None,
++        use_cache: Optional[bool] = None,
++        output_attentions: Optional[bool] = None,
++        output_hidden_states: Optional[bool] = None,
++        return_dict: Optional[bool] = None,
++    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
++        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
++        output_hidden_states = (
++            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
++        )
++        use_cache = use_cache if use_cache is not None else self.config.use_cache
++        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+ 
++        if input_ids is not None and inputs_embeds is not None:
++            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
++        elif input_ids is not None:
++            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
++            input_shape = input_ids.size()
++            input_ids = input_ids.view(-1, input_shape[-1])
++            batch_size = input_ids.shape[0]
++        elif inputs_embeds is not None:
++            input_shape = inputs_embeds.size()[:-1]
++            batch_size = inputs_embeds.shape[0]
++        else:
++            raise ValueError("You have to specify either input_ids or inputs_embeds")
++
++        device = input_ids.device if input_ids is not None else inputs_embeds.device
++
++        if token_type_ids is not None:
++            token_type_ids = token_type_ids.view(-1, input_shape[-1])
++        if position_ids is not None:
++            position_ids = position_ids.view(-1, input_shape[-1])
+ 
++        if past_key_values is None:
++            past_length = 0
++            past_key_values = tuple([None] * len(self.h))
++        else:
++            past_length = past_key_values[0][0].size(-2)
++        if position_ids is None:
++            position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
++            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
++
++        # GPT2Attention mask.
++        if attention_mask is not None:
++            if batch_size <= 0:
++                raise ValueError("batch_size has to be defined and > 0")
++            attention_mask = attention_mask.view(batch_size, -1)
++            # We create a 3D attention mask from a 2D tensor mask.
++            # Sizes are [batch_size, 1, 1, to_seq_length]
++            # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
++            # this attention mask is more simple than the triangular masking of causal attention
++            # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
++            attention_mask = attention_mask[:, None, None, :]
++
++            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
++            # masked positions, this operation will create a tensor which is 0.0 for
++            # positions we want to attend and the dtype's smallest value for masked positions.
++            # Since we are adding it to the raw scores before the softmax, this is
++            # effectively the same as removing these entirely.
++            attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
++            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
++
++        # If a 2D or 3D attention mask is provided for the cross-attention
++        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
++        if self.config.add_cross_attention and encoder_hidden_states is not None:
++            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
++            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
++            if encoder_attention_mask is None:
++                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
++            encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
++        else:
++            encoder_attention_mask = None
++
++        # Prepare head mask if needed
++        # 1.0 in head_mask indicate we keep the head
++        # attention_probs has shape bsz x n_heads x N x N
++        # head_mask has shape n_layer x batch x n_heads x N x N
++        head_mask = self.get_head_mask(head_mask, self.config.n_layer)
++
++        if inputs_embeds is None:
++            inputs_embeds = self.wte(input_ids)
++        position_embeds = self.wpe(position_ids)
++        hidden_states = inputs_embeds + position_embeds
++
++        if token_type_ids is not None:
++            token_type_embeds = self.wte(token_type_ids)
++            hidden_states = hidden_states + token_type_embeds
++
++        hidden_states = self.drop(hidden_states)
++
++        output_shape = (-1,) + input_shape[1:] + (hidden_states.size(-1),)
++
++        if self.gradient_checkpointing and self.training:
++            if use_cache:
++                print("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`...")
++                use_cache = False
++
++        presents = () if use_cache else None
++        all_self_attentions = () if output_attentions else None
++        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
++        all_hidden_states = () if output_hidden_states else None
++        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
++            # Model parallel
++            if self.model_parallel:
++                torch.cuda.set_device(hidden_states.device)
++                # Ensure layer_past is on same device as hidden_states (might not be correct)
++                if layer_past is not None:
++                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
++                # Ensure that attention_mask is always on the same device as hidden_states
++                if attention_mask is not None:
++                    attention_mask = attention_mask.to(hidden_states.device)
++                if isinstance(head_mask, torch.Tensor):
++                    head_mask = head_mask.to(hidden_states.device)
++            if output_hidden_states:
++                all_hidden_states = all_hidden_states + (hidden_states,)
++
++            if self.gradient_checkpointing and self.training:
++
++                def create_custom_forward(module):
++                    def custom_forward(*inputs):
++                        # None for past_key_value
++                        return module(*inputs, use_cache, output_attentions)
++
++                    return custom_forward
++
++                outputs = torch.utils.checkpoint.checkpoint(
++                    create_custom_forward(block),
++                    hidden_states,
++                    None,
++                    attention_mask,
++                    head_mask[i],
++                    encoder_hidden_states,
++                    encoder_attention_mask,
++                )
++            else:
++                outputs = block(
++                    hidden_states,
++                    layer_past=layer_past,
++                    attention_mask=attention_mask,
++                    head_mask=head_mask[i],
++                    encoder_hidden_states=encoder_hidden_states,
++                    encoder_attention_mask=encoder_attention_mask,
++                    use_cache=use_cache,
++                    output_attentions=output_attentions,
++                )
++
++            hidden_states = outputs[0]
++            if use_cache is True:
++                presents = presents + (outputs[1],)
++
++            if output_attentions:
++                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
++                if self.config.add_cross_attention:
++                    all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
++
++            # Model Parallel: If it's the last layer for that device, put things on the next device
++            if self.model_parallel:
++                for k, v in self.device_map.items():
++                    if i == v[-1] and "cuda:" + str(k) != self.last_device:
++                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
++
++        hidden_states = self.ln_f(hidden_states)
++
++        hidden_states = hidden_states.view(output_shape)
++        # Add last hidden state
++        if output_hidden_states:
++            all_hidden_states = all_hidden_states + (hidden_states,)
++
++        if not return_dict:
++            return tuple(
++                v
++                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
++                if v is not None
++            )
++
++        return BaseModelOutputWithPastAndCrossAttentions(
++            last_hidden_state=hidden_states,
++            past_key_values=presents,
++            hidden_states=all_hidden_states,
++            attentions=all_self_attentions,
++            cross_attentions=all_cross_attentions,
++        )
++
++    def forward(self, input_ids=None, labels=None, **kwargs):
++        outputs = self.accustum_forward(input_ids, **kwargs)
++        return outputs.last_hidden_state, outputs.hidden_states  # final feat, intermidiate feat
+ 
+ 
+diff --git a/models/PowerformerAttention.py b/models/PowerformerAttention.py
+new file mode 100644
+index 0000000..6d46580
+--- /dev/null
++++ b/models/PowerformerAttention.py
+@@ -0,0 +1,220 @@
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import math
++from typing import Optional, Tuple
++
++
++class WeightedCausalMultiheadAttention(nn.Module):
++    """
++    Weighted Causal Multihead Attention (WCMHA) from Powerformer.
++    
++    This module implements power-law decay attention for time series:
++    - Causal masking: future cannot attend to past (mask = -inf)
++    - Power-law decay: attention decays as -alpha * log(delta_t) for causal connections
++    
++    Args:
++        embed_dim: Total dimension of the model
++        num_heads: Number of attention heads
++        alpha: Power-law decay parameter (controls decay speed)
++        dropout: Dropout probability
++        bias: Whether to use bias in projections
++    """
++    
++    def __init__(
++        self,
++        embed_dim: int,
++        num_heads: int,
++        alpha: float = 1.0,
++        dropout: float = 0.0,
++        bias: bool = True,
++    ):
++        super().__init__()
++        self.embed_dim = embed_dim
++        self.num_heads = num_heads
++        self.alpha = alpha
++        self.dropout = dropout
++        self.head_dim = embed_dim // num_heads
++        
++        if self.head_dim * num_heads != self.embed_dim:
++            raise ValueError(
++                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
++                f" and `num_heads`: {num_heads})."
++            )
++        
++        self.scaling = self.head_dim ** -0.5
++        
++        # Linear projections for Q, K, V (combined for efficiency like GPT2)
++        self.c_attn = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
++        self.c_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
++        
++        self.attn_dropout = nn.Dropout(dropout)
++        self.resid_dropout = nn.Dropout(dropout)
++        
++    def _create_power_law_mask(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
++        """
++        Create power-law decay mask for causal attention.
++        
++        Args:
++            seq_len: Sequence length
++            device: Device for the mask tensor
++            dtype: Data type for the mask tensor
++            
++        Returns:
++            Mask tensor of shape (seq_len, seq_len)
++        """
++        # Create time difference matrix: delta_t[i,j] = i - j
++        # Use float for intermediate calculations to avoid dtype issues
++        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
++        delta_t = positions.unsqueeze(0) - positions.unsqueeze(1)  # (seq_len, seq_len)
++        
++        # Initialize mask with zeros
++        mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.float32)
++        
++        # For non-causal connections (delta_t < 0, i.e., future attending to current/past)
++        # Set to -inf so attention weight becomes 0
++        mask = mask.masked_fill(delta_t < 0, float('-inf'))
++        
++        # For causal connections (delta_t >= 0), apply power-law decay: -alpha * log(delta_t + 1)
++        # Note: delta_t = 0 (self-attention) should have no penalty (log(1) = 0)
++        # For delta_t > 0, apply the power-law decay
++        causal_mask = delta_t > 0
++        if causal_mask.any():
++            # Use log(delta_t + 1) to handle delta_t=0 case (log(1) = 0, no penalty for self-attention)
++            log_delta_t = torch.log(delta_t + 1.0)
++            power_law_penalty = -self.alpha * log_delta_t
++            mask = torch.where(causal_mask, power_law_penalty, mask)
++        
++        # Convert to target dtype
++        return mask.to(dtype)
++        
++        return mask
++    
++    def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
++        """
++        Split hidden dimension into num_heads and head_dim.
++        
++        Args:
++            tensor: Input tensor of shape (batch, seq_len, embed_dim)
++            
++        Returns:
++            Tensor of shape (batch, num_heads, seq_len, head_dim)
++        """
++        batch_size, seq_len, _ = tensor.shape
++        tensor = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
++        return tensor.permute(0, 2, 1, 3)  # (batch, num_heads, seq_len, head_dim)
++    
++    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
++        """
++        Merge num_heads and head_dim back into embed_dim.
++        
++        Args:
++            tensor: Input tensor of shape (batch, num_heads, seq_len, head_dim)
++            
++        Returns:
++            Tensor of shape (batch, seq_len, embed_dim)
++        """
++        batch_size, _, seq_len, _ = tensor.shape
++        tensor = tensor.permute(0, 2, 1, 3).contiguous()  # (batch, seq_len, num_heads, head_dim)
++        return tensor.view(batch_size, seq_len, self.embed_dim)
++    
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask: Optional[torch.Tensor] = None,
++        layer_past: Optional[Tuple[torch.Tensor]] = None,
++        head_mask: Optional[torch.Tensor] = None,
++        use_cache: bool = False,
++        output_attentions: bool = False,
++    ) -> Tuple[torch.Tensor, ...]:
++        """
++        Forward pass for WCMHA.
++        
++        Args:
++            hidden_states: Input tensor of shape (batch, seq_len, embed_dim)
++            attention_mask: Optional attention mask
++            layer_past: Optional cached key/value from previous forward pass
++            head_mask: Optional mask for attention heads
++            use_cache: Whether to return key/value for caching
++            output_attentions: Whether to return attention weights
++            
++        Returns:
++            Tuple of (output, present, attentions) where:
++                - output: Attention output of shape (batch, seq_len, embed_dim)
++                - present: Optional cached (key, value) if use_cache=True
++                - attentions: Optional attention weights if output_attentions=True
++        """
++        batch_size, seq_len, _ = hidden_states.shape
++        
++        # Project to Q, K, V
++        qkv = self.c_attn(hidden_states)
++        query, key, value = qkv.split(self.embed_dim, dim=2)
++        
++        # Split heads
++        query = self._split_heads(query)  # (batch, num_heads, seq_len, head_dim)
++        key = self._split_heads(key)
++        value = self._split_heads(value)
++        
++        # Handle cached key/value for generation
++        if layer_past is not None:
++            past_key, past_value = layer_past
++            key = torch.cat([past_key, key], dim=-2)
++            value = torch.cat([past_value, value], dim=-2)
++        
++        if use_cache:
++            present = (key, value)
++        else:
++            present = None
++        
++        # Compute attention scores: Q * K^T / sqrt(d_k)
++        attn_weights = torch.matmul(query, key.transpose(-1, -2))  # (batch, num_heads, seq_len, key_seq_len)
++        attn_weights = attn_weights * self.scaling
++        
++        # Get the sequence length for the keys (might be longer than seq_len if using cache)
++        key_seq_len = key.shape[-2]
++        
++        # Apply power-law decay mask
++        power_law_mask = self._create_power_law_mask(
++            key_seq_len, 
++            device=hidden_states.device, 
++            dtype=attn_weights.dtype
++        )
++        
++        # If we have past keys, we only apply mask to the relevant portion
++        if layer_past is not None:
++            # For generation, only apply mask to new positions
++            power_law_mask = power_law_mask[-seq_len:, :]
++        
++        # Add power-law mask (broadcasting across batch and heads)
++        attn_weights = attn_weights + power_law_mask.unsqueeze(0).unsqueeze(0)
++        
++        # Apply additional attention mask if provided (e.g., padding mask)
++        if attention_mask is not None:
++            # attention_mask shape: (batch, 1, 1, key_seq_len) or similar
++            attn_weights = attn_weights + attention_mask
++        
++        # Softmax to get attention probabilities
++        attn_weights = F.softmax(attn_weights, dim=-1)
++        
++        # Apply dropout
++        attn_weights = self.attn_dropout(attn_weights)
++        
++        # Apply head mask if provided
++        if head_mask is not None:
++            attn_weights = attn_weights * head_mask
++        
++        # Compute attention output: weighted sum of values
++        attn_output = torch.matmul(attn_weights, value)  # (batch, num_heads, seq_len, head_dim)
++        
++        # Merge heads
++        attn_output = self._merge_heads(attn_output)  # (batch, seq_len, embed_dim)
++        
++        # Final projection
++        attn_output = self.c_proj(attn_output)
++        attn_output = self.resid_dropout(attn_output)
++        
++        outputs = (attn_output, present)
++        if output_attentions:
++            outputs = outputs + (attn_weights,)
++        
++        return outputs  # (attn_output, present, (attentions))
+diff --git a/models/PowerformerGPT2.py b/models/PowerformerGPT2.py
+new file mode 100644
+index 0000000..7e791b0
+--- /dev/null
++++ b/models/PowerformerGPT2.py
+@@ -0,0 +1,265 @@
++"""
++Custom GPT2 architecture with Powerformer's Weighted Causal Multihead Attention.
++
++This module provides GPT2 blocks that use WCMHA instead of standard self-attention
++for improved time series modeling with power-law decay temporal dependencies.
++"""
++
++import torch
++import torch.nn as nn
++from typing import Optional, Tuple, Union
++from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model
++from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
++from models.PowerformerAttention import WeightedCausalMultiheadAttention
++
++
++class PowerformerGPT2Attention(nn.Module):
++    """
++    GPT2 Attention module using WCMHA instead of standard attention.
++    This is a drop-in replacement for GPT2Attention that uses power-law decay.
++    """
++    
++    def __init__(self, config, alpha: float = 1.0, is_cross_attention: bool = False, layer_idx: Optional[int] = None):
++        super().__init__()
++        
++        self.config = config
++        self.is_cross_attention = is_cross_attention
++        self.layer_idx = layer_idx
++        
++        max_positions = config.max_position_embeddings
++        self.bias = torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)).view(
++            1, 1, max_positions, max_positions
++        )
++        self.masked_bias = torch.tensor(-1e4)
++        
++        self.embed_dim = config.hidden_size
++        self.num_heads = config.num_attention_heads
++        self.head_dim = self.embed_dim // self.num_heads
++        self.split_size = self.embed_dim
++        
++        if self.head_dim * self.num_heads != self.embed_dim:
++            raise ValueError(
++                f"`embed_dim` must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
++                f" {self.num_heads})."
++            )
++        
++        # Use WCMHA for self-attention
++        if not is_cross_attention:
++            self.wcmha = WeightedCausalMultiheadAttention(
++                embed_dim=self.embed_dim,
++                num_heads=self.num_heads,
++                alpha=alpha,
++                dropout=config.attn_pdrop,
++                bias=True,
++            )
++            # For compatibility, we still need these attributes even though WCMHA handles them
++            self.c_attn = self.wcmha.c_attn
++            self.c_proj = self.wcmha.c_proj
++        else:
++            # For cross-attention, use standard projections
++            self.c_attn = nn.Linear(self.embed_dim, 2 * self.embed_dim)
++            self.q_attn = nn.Linear(self.embed_dim, self.embed_dim)
++            self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
++            
++        self.attn_dropout = nn.Dropout(config.attn_pdrop)
++        self.resid_dropout = nn.Dropout(config.resid_pdrop)
++        
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        layer_past: Optional[Tuple[torch.Tensor]] = None,
++        attention_mask: Optional[torch.FloatTensor] = None,
++        head_mask: Optional[torch.FloatTensor] = None,
++        encoder_hidden_states: Optional[torch.Tensor] = None,
++        encoder_attention_mask: Optional[torch.FloatTensor] = None,
++        use_cache: Optional[bool] = False,
++        output_attentions: Optional[bool] = False,
++    ) -> Tuple[torch.Tensor, ...]:
++        """
++        Forward pass using WCMHA for self-attention.
++        """
++        if encoder_hidden_states is not None:
++            # This is cross-attention, use standard attention mechanism
++            if not hasattr(self, 'q_attn'):
++                raise ValueError(
++                    "If class is used as cross attention, the weights `q_attn` have to be defined. "
++                    "Please make sure to instantiate class with `PowerformerGPT2Attention(..., is_cross_attention=True)`."
++                )
++            
++            # Standard cross-attention implementation
++            query = self.q_attn(hidden_states)
++            key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
++            attention_mask = encoder_attention_mask
++            
++            # Implement standard attention here
++            # This is a simplified version - full implementation would match GPT2Attention
++            raise NotImplementedError("Cross-attention with WCMHA is not yet implemented")
++        else:
++            # Self-attention using WCMHA
++            outputs = self.wcmha(
++                hidden_states=hidden_states,
++                attention_mask=attention_mask,
++                layer_past=layer_past,
++                head_mask=head_mask,
++                use_cache=use_cache,
++                output_attentions=output_attentions,
++            )
++            
++            return outputs
++
++
++class PowerformerGPT2Block(nn.Module):
++    """
++    GPT2 Block using Powerformer's WCMHA attention.
++    This is a modified version of GPT2Block that uses PowerformerGPT2Attention.
++    """
++    
++    def __init__(self, config, alpha: float = 1.0, layer_idx: Optional[int] = None):
++        super().__init__()
++        hidden_size = config.hidden_size
++        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
++        
++        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
++        self.attn = PowerformerGPT2Attention(config, alpha=alpha, layer_idx=layer_idx)
++        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
++        
++        if config.add_cross_attention:
++            self.crossattention = PowerformerGPT2Attention(
++                config, is_cross_attention=True, layer_idx=layer_idx
++            )
++            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
++        
++        # MLP
++        self.mlp = nn.ModuleDict({
++            'c_fc': nn.Linear(hidden_size, inner_dim),
++            'c_proj': nn.Linear(inner_dim, hidden_size),
++            'act': nn.GELU(),
++            'dropout': nn.Dropout(config.resid_pdrop),
++        })
++        
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        layer_past: Optional[Tuple[torch.Tensor]] = None,
++        attention_mask: Optional[torch.FloatTensor] = None,
++        head_mask: Optional[torch.FloatTensor] = None,
++        encoder_hidden_states: Optional[torch.Tensor] = None,
++        encoder_attention_mask: Optional[torch.FloatTensor] = None,
++        use_cache: Optional[bool] = False,
++        output_attentions: Optional[bool] = False,
++    ) -> Tuple[torch.Tensor, ...]:
++        """
++        Forward pass for the Powerformer GPT2 block.
++        """
++        residual = hidden_states
++        hidden_states = self.ln_1(hidden_states)
++        attn_outputs = self.attn(
++            hidden_states,
++            layer_past=layer_past,
++            attention_mask=attention_mask,
++            head_mask=head_mask,
++            use_cache=use_cache,
++            output_attentions=output_attentions,
++        )
++        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
++        outputs = attn_outputs[1:]
++        
++        # Residual connection
++        hidden_states = attn_output + residual
++        
++        # Cross-attention (if applicable)
++        if encoder_hidden_states is not None:
++            # Add cross-attention if model has it
++            if not hasattr(self, 'crossattention'):
++                raise ValueError(
++                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
++                    "cross-attention layers by setting `config.add_cross_attention=True`"
++                )
++            
++            residual = hidden_states
++            hidden_states = self.ln_cross_attn(hidden_states)
++            cross_attn_outputs = self.crossattention(
++                hidden_states,
++                attention_mask=attention_mask,
++                head_mask=head_mask,
++                encoder_hidden_states=encoder_hidden_states,
++                encoder_attention_mask=encoder_attention_mask,
++                output_attentions=output_attentions,
++            )
++            attn_output = cross_attn_outputs[0]
++            hidden_states = residual + attn_output
++            outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
++        
++        # Feed-forward
++        residual = hidden_states
++        hidden_states = self.ln_2(hidden_states)
++        feed_forward_hidden_states = self.mlp['c_fc'](hidden_states)
++        feed_forward_hidden_states = self.mlp['act'](feed_forward_hidden_states)
++        feed_forward_hidden_states = self.mlp['c_proj'](feed_forward_hidden_states)
++        feed_forward_hidden_states = self.mlp['dropout'](feed_forward_hidden_states)
++        
++        # Residual connection
++        hidden_states = residual + feed_forward_hidden_states
++        
++        if use_cache:
++            outputs = (hidden_states,) + outputs
++        else:
++            outputs = (hidden_states,) + outputs[1:]
++        
++        return outputs  # hidden_states, present, (attentions, cross_attentions)
++
++
++class PowerformerGPT2Model(GPT2Model):
++    """
++    GPT2 Model that uses Powerformer's WCMHA for time series modeling.
++    This model replaces standard GPT2 blocks with PowerformerGPT2Block.
++    """
++    
++    def __init__(self, config, alpha: float = 1.0):
++        super().__init__(config)
++        self.alpha = alpha
++        
++        # Replace the standard GPT2 blocks with Powerformer blocks
++        self.h = nn.ModuleList([
++            PowerformerGPT2Block(config, alpha=alpha, layer_idx=i)
++            for i in range(config.num_hidden_layers)
++        ])
++        
++        # Re-initialize weights
++        self.post_init()
++        
++    def forward(
++        self,
++        input_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
++        attention_mask: Optional[torch.FloatTensor] = None,
++        token_type_ids: Optional[torch.LongTensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        head_mask: Optional[torch.FloatTensor] = None,
++        inputs_embeds: Optional[torch.FloatTensor] = None,
++        encoder_hidden_states: Optional[torch.Tensor] = None,
++        encoder_attention_mask: Optional[torch.FloatTensor] = None,
++        use_cache: Optional[bool] = None,
++        output_attentions: Optional[bool] = None,
++        output_hidden_states: Optional[bool] = None,
++        return_dict: Optional[bool] = None,
++    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
++        """
++        Forward pass - delegates to parent GPT2Model which uses our custom blocks.
++        """
++        # The parent class forward method will use our custom self.h blocks
++        return super().forward(
++            input_ids=input_ids,
++            past_key_values=past_key_values,
++            attention_mask=attention_mask,
++            token_type_ids=token_type_ids,
++            position_ids=position_ids,
++            head_mask=head_mask,
++            inputs_embeds=inputs_embeds,
++            encoder_hidden_states=encoder_hidden_states,
++            encoder_attention_mask=encoder_attention_mask,
++            use_cache=use_cache,
++            output_attentions=output_attentions,
++            output_hidden_states=output_hidden_states,
++            return_dict=return_dict,
++        )
