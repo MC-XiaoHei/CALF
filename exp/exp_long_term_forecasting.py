@@ -2,7 +2,7 @@ from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
-from utils.cmLoss import cmLoss
+# from utils.cmLoss import cmLoss # 移除 cmLoss
 import torch
 import torch.nn as nn
 from torch import optim
@@ -31,23 +31,24 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        param_dict = [
-            {"params": [p for n, p in self.model.named_parameters() if p.requires_grad and '_proj' in n], "lr": 1e-4},
-            {"params": [p for n, p in self.model.named_parameters() if p.requires_grad and '_proj' not in n], "lr": self.args.learning_rate}
-        ]
-        model_optim = optim.Adam([param_dict[1]], lr=self.args.learning_rate)
-        loss_optim = optim.Adam([param_dict[0]], lr=self.args.learning_rate)
+        # 新模型(TimeCMA)不需要区分 'proj' 参数。
+        # 它在 __init__ 内部冻结了 VLM，所以我们只优化 requires_grad=True 的参数。
+        model_optim = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
+                                 lr=self.args.learning_rate)
 
-        return model_optim, loss_optim
+        # 不再需要 loss_optim
+        return model_optim, None  # 返回 None 以匹配旧代码的元组解包
 
     def _select_criterion(self):
-        criterion = cmLoss(self.args.feature_loss, 
-                           self.args.output_loss, 
-                           self.args.task_loss, 
-                           self.args.task_name, 
-                           self.args.feature_w, 
-                           self.args.output_w, 
-                           self.args.task_w)
+        # 新模型不再使用 cmLoss，因为它只返回 'outputs'
+        # 我们根据 run.py 中的 'task_loss' 参数选择标准损失
+        if self.args.task_loss == 'mse':
+            criterion = nn.MSELoss()
+        elif self.args.task_loss == 'l1':
+            criterion = nn.L1Loss()
+        else:
+            print(f"Warning: Unknown task_loss '{self.args.task_loss}'. Defaulting to L1Loss.")
+            criterion = nn.L1Loss()
         return criterion
 
     def train(self, setting):
@@ -64,9 +65,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
-        model_optim, loss_optim = self._select_optimizer()
+        model_optim, loss_optim = self._select_optimizer()  # loss_optim 将是 None
         criterion = self._select_criterion()
-        
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=self.args.tmax, eta_min=1e-8)
 
         for epoch in range(self.args.train_epochs):
@@ -78,14 +79,23 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
-                loss_optim.zero_grad()
+                # loss_optim.zero_grad() # 移除
 
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
-                
+
+                # batch_x_mark 和 batch_y_mark 在新模型中不使用
+
                 outputs_dict = self.model(batch_x)
-                
-                loss = criterion(outputs_dict, batch_y)
+
+                # --- 关键更改：从新模型的字典中提取 'outputs' ---
+                outputs = outputs_dict['outputs']
+
+                # 确保只比较预测部分
+                outputs = outputs[:, -self.args.pred_len:, :]
+                batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
+
+                loss = criterion(outputs, batch_y)
 
                 train_loss.append(loss.item())
 
@@ -99,7 +109,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 loss.backward()
                 model_optim.step()
-                loss_optim.step()
+                # loss_optim.step() # 移除
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -129,40 +139,34 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
 
-        self.model.in_layer.eval()
-        self.model.out_layer.eval()
-        self.model.time_proj.eval()
-        self.model.text_proj.eval()
-
+        # 新模型 (TimeCMA) 在 __init__ 中设置了 VLM 为 .eval()
+        # 我们只需要切换整个模型（的可训练部分）
+        self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float()
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                # batch_x_mark 和 batch_y_mark 在新模型中不使用
 
-                outputs = self.model(batch_x)
+                outputs_dict = self.model(batch_x)
 
-                outputs_ensemble = outputs['outputs_time']
-                # encoder - decoder
+                # --- 关键更改：使用 'outputs' ---
+                outputs_ensemble = outputs_dict['outputs']
+
                 outputs_ensemble = outputs_ensemble[:, -self.args.pred_len:, :]
                 batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
 
                 pred = outputs_ensemble.detach().cpu()
                 true = batch_y.detach().cpu()
 
-                loss = F.mse_loss(pred, true)
+                loss = criterion(pred, true)  # 使用传入的 criterion
 
-                total_loss.append(loss)
+                total_loss.append(loss.item())
 
         total_loss = np.average(total_loss)
 
-        self.model.in_layer.train()
-        self.model.out_layer.train()
-        self.model.time_proj.train()
-        self.model.text_proj.train()
-
+        self.model.train()  # 切换回训练模式
         return total_loss
 
     def test(self, setting, test=0):
@@ -188,10 +192,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                outputs = self.model(batch_x[:, -self.args.seq_len:, :])
+                outputs_dict = self.model(batch_x[:, -self.args.seq_len:, :])
 
-                outputs_ensemble = outputs['outputs_time']
-                
+                # --- 关键更改：使用 'outputs' ---
+                outputs_ensemble = outputs_dict['outputs']
+
                 outputs_ensemble = outputs_ensemble[:, -self.args.pred_len:, :]
                 batch_y = batch_y[:, -self.args.pred_len:, :]
 

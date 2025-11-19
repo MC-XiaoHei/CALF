@@ -20,6 +20,8 @@ class AccustumGPT2Model(GPT2Model):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        use_powerformer_mask: bool = False,
+            powerformer_alpha: float = 2.0,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -58,24 +60,50 @@ class AccustumGPT2Model(GPT2Model):
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
         # GPT2Attention mask.
+        padding_mask = None
         if attention_mask is not None:
             if batch_size <= 0:
                 raise ValueError("batch_size has to be defined and > 0")
             attention_mask = attention_mask.view(batch_size, -1)
             # We create a 3D attention mask from a 2D tensor mask.
             # Sizes are [batch_size, 1, 1, to_seq_length]
-            # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
-            # this attention mask is more simple than the triangular masking of causal attention
-            # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
             attention_mask = attention_mask[:, None, None, :]
 
             # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
             # masked positions, this operation will create a tensor which is 0.0 for
             # positions we want to attend and the dtype's smallest value for masked positions.
-            # Since we are adding it to the raw scores before the softmax, this is
-            # effectively the same as removing these entirely.
             attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+            padding_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+
+        if use_powerformer_mask:
+            seq_len = input_shape[-1]
+
+            # 使用传入的 powerformer_alpha，而不是硬编码的 2.0
+            alpha = powerformer_alpha
+
+            # 创建时间差矩阵 (Δt)，+1 以避免 log(0)
+            indices = torch.arange(seq_len, device=device)
+            delta_t = (indices.unsqueeze(0) - indices.unsqueeze(1)).abs() + 1  # (S, S)
+
+            # 计算幂律衰减: -alpha * log(delta_t)
+            power_mask = -alpha * torch.log(delta_t.float())  # (S, S)
+
+            # 创建因果掩码 (未来为 -inf, 过去和现在为 0)
+            causal_mask = torch.triu(torch.full((seq_len, seq_len), -torch.inf, device=device), diagonal=1)
+
+            # 组合: 未来使用 -inf, 过去和现在使用 power_mask
+            combined_mask = torch.where(causal_mask == -torch.inf, causal_mask, power_mask)  # (S, S)
+
+            # 增加 batch 和 head 维度: (1, 1, S, S)
+            attention_mask = combined_mask.unsqueeze(0).unsqueeze(0)
+
+            if padding_mask is not None:
+                # 加上填充掩码. (1, 1, S, S) + (B, 1, 1, S) -> (B, 1, S, S)
+                attention_mask = attention_mask + padding_mask
+        else:
+            # 原始逻辑: 仅使用填充掩码 (或 None)
+            # 如果 padding_mask 为 None, transformers 会自动使用内置的 self.bias (标准因果掩码)
+            attention_mask = padding_mask
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -198,8 +226,13 @@ class AccustumGPT2Model(GPT2Model):
             cross_attentions=all_cross_attentions,
         )
 
-    def forward(self, input_ids=None, labels=None, **kwargs):
-        outputs = self.accustum_forward(input_ids, **kwargs)
+    def forward(self, input_ids=None, labels=None, use_powerformer_mask=False, powerformer_alpha=2.0, **kwargs):
+        outputs = self.accustum_forward(
+            input_ids,
+            use_powerformer_mask=use_powerformer_mask,
+            powerformer_alpha=powerformer_alpha,
+            **kwargs
+        )
         return outputs.last_hidden_state, outputs.hidden_states # final feat, intermidiate feat
 
 

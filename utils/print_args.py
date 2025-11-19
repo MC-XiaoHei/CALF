@@ -44,7 +44,8 @@ def print_args(args):
     print(f'  {"Num Workers:":<20}{args.num_workers:<20}{"Itr:":<20}{args.itr:<20}')
     print(f'  {"Train Epochs:":<20}{args.train_epochs:<20}{"Batch Size:":<20}{args.batch_size:<20}')
     print(f'  {"Patience:":<20}{args.patience:<20}{"Learning Rate:":<20}{args.learning_rate:<20}')
-    print(f'  {"Des:":<20}{args.des:<20}{"Feature Loss:":<20}{args.feature_loss:<20}{"Output Loss:":<20}{args.output_loss:<20}{"Task Loss:":<20}{args.task_loss:<20}')
+    # 修改了这一行，移除了 feature_loss 和 output_loss
+    print(f'  {"Des:":<20}{args.des:<20}{"Task Loss:":<20}{args.task_loss:<20}')
     print(f'  {"Lradj:":<20}{args.lradj:<20}{"Use Amp:":<20}{args.use_amp:<20}')
     print()
 
@@ -55,10 +56,7 @@ def print_args(args):
 
     print("\033[1m" + "De-stationary Projector Params" + "\033[0m")
     p_hidden_dims_str = ', '.join(map(str, args.p_hidden_dims))
-    print(f'  {"P Hidden Dims:":<20}{p_hidden_dims_str:<20}{"P Hidden Layers:":<20}{args.p_hidden_layers:<20}') 
+    print(f'  {"P Hidden Dims:":<20}{p_hidden_dims_str:<20}{"P Hidden Layers:":<20}{args.p_hidden_layers:<20}')
     print()
 
-    print("\033[1m" + "Distill Loss Weight" + "\033[0m")
-    p_hidden_dims_str = ', '.join(map(str, args.p_hidden_dims))
-    print(f'  {"Feature Weight:":<20}{args.feature_w:<20}{"Output Weight:":<20}{args.output_w:<20}{"Task Weight:":<20}{args.task_w:<20}') 
-    print()
+    # 移除了 "Distill Loss Weight" 部分，因为这些参数已不再使用

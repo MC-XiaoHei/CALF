@@ -16,15 +16,15 @@ if __name__ == '__main__':
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
 
-    parser = argparse.ArgumentParser(description='TimesNet')
+    parser = argparse.ArgumentParser(description='CALF (TimeCMA adapted)')
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
                         help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
-    parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                        help='model name, options: [Autoformer, Transformer, TimesNet]')
+    parser.add_argument('--model', type=str, required=True, default='CALF',
+                        help='model name')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
@@ -39,7 +39,7 @@ if __name__ == '__main__':
 
     # forecasting task
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
-    parser.add_argument('--label_len', type=int, default=48, help='start token length')
+    parser.add_argument('--label_len', type=int, default=48, help='start token length (may not be used by new model)')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
@@ -51,18 +51,18 @@ if __name__ == '__main__':
     parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior anomaly ratio (%)')
 
     # model define
-    parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
-    parser.add_argument('--num_kernels', type=int, default=6, help='for Inception')
-    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
-    parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
-    parser.add_argument('--c_out', type=int, default=7, help='output size')
-    parser.add_argument('--d_model', type=int, default=512, help='dimension of model')
-    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
-    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
-    parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
-    parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn')
-    parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
-    parser.add_argument('--factor', type=int, default=1, help='attn factor')
+    parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock (not used by CALF/TimeCMA)')
+    parser.add_argument('--num_kernels', type=int, default=6, help='for Inception (not used by CALF/TimeCMA)')
+    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size (number of variables)')
+    parser.add_argument('--dec_in', type=int, default=7, help='decoder input size (not used by CALF/TimeCMA)')
+    parser.add_argument('--c_out', type=int, default=7, help='output size (not used by CALF/TimeCMA)')
+    parser.add_argument('--d_model', type=int, default=128, help='dimension of model (channel)')
+    parser.add_argument('--n_heads', type=int, default=4, help='num of heads')
+    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers (not used by CALF/TimeCMA)')
+    parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers (not used by CALF/TimeCMA)')
+    parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn (not used by CALF/TimeCMA)')
+    parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average (used in decomp)')
+    parser.add_argument('--factor', type=int, default=1, help='attn factor (not used by CALF/TimeCMA)')
     parser.add_argument('--distil', action='store_false',
                         help='whether to use distilling in encoder, using this argument means not using distilling',
                         default=True)
@@ -82,9 +82,9 @@ if __name__ == '__main__':
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
-    parser.add_argument('--task_loss', type=str, default='l1', help='task loss function')
-    parser.add_argument('--feature_loss', type=str, default='l1', help='distillation loss function')
-    parser.add_argument('--output_loss', type=str, default='l1', help='logits loss function')
+    parser.add_argument('--task_loss', type=str, default='l1', help='task loss function (l1 or mse)')
+
+    # (移除了 feature_loss 和 output_loss)
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
@@ -92,7 +92,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
 
-    # de-stationary projector params
+    # de-stationary projector params (not used by CALF/TimeCMA)
     parser.add_argument('--p_hidden_dims', type=int, nargs='+', default=[128, 128],
                         help='hidden layer dimensions of projector (List)')
     parser.add_argument('--p_hidden_layers', type=int, default=2, help='number of hidden layers in projector')
@@ -101,30 +101,26 @@ if __name__ == '__main__':
     parser.add_argument('--tmax', type=int, default=20)
     parser.add_argument('--cos', type=int, default=1)
 
-    # lora
-    parser.add_argument('--r', type=int, default=8)
-    parser.add_argument('--lora_alpha', type=int, default=32)
-    parser.add_argument('--lora_dropout', type=float, default=0.1)
+    # (移除了 lora, align, loss weight, gpt_layers 参数)
 
-    # align
-    parser.add_argument('--word_embedding_path', type=str, default="wte_pca_500.pt")
-
-    # loss weight
-    parser.add_argument('--task_w', type=float, default=1.0)
-    parser.add_argument('--feature_w', type=float, default=0.01)
-    parser.add_argument('--output_w', type=float, default=1.0)
-    
-    # gpt
-    parser.add_argument('--gpt_layers', type=int, default=32, help='number of hidden layers in gpt')
-    
     # few shot percentage
     parser.add_argument('--percent', type=int, default=100, help='few shot percentage')
-    
+
     # zero shot
     parser.add_argument('--zero_shot', type=int, default=0, help='1 for training zero shot')
     parser.add_argument('--target_data', type=str, default="ETTm1", help='target data for zero shot')
 
+    # TimeCMA (新模型) 特定参数
+    parser.add_argument('--vit_path', type=str, default='google/vit-base-patch16-224-in21k', help='Path to ViT model')
+    parser.add_argument('--gpt_path', type=str, default='gpt2', help='Path to GPT-2 model')
+    parser.add_argument('--decomp_kernel', type=int, default=25,
+                        help='Kernel size for SeriesDecomp (replaces moving_avg)')
+
     args = parser.parse_args()
+
+    # 使用 decomp_kernel 替换 moving_avg
+    args.moving_avg = args.decomp_kernel
+
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -153,7 +149,8 @@ if __name__ == '__main__':
         for ii in range(args.itr):
             # setting record of experiments
             exp = Exp(args)  # set experiments
-            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_gpt{}_{}'.format(
+            # 更新 setting 字符串 (移除了 gpt_layers)
+            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
                 args.task_name,
                 args.model_id,
                 args.model,
@@ -170,8 +167,7 @@ if __name__ == '__main__':
                 args.factor,
                 args.embed,
                 args.distil,
-                args.des, 
-                args.gpt_layers,
+                args.des,
                 ii)
 
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -182,7 +178,8 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
     else:
         ii = 0
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_gpt{}_{}'.format(
+        # 更新 setting 字符串 (移除了 gpt_layers)
+        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
             args.task_name,
             args.model_id,
             args.model,
@@ -199,8 +196,7 @@ if __name__ == '__main__':
             args.factor,
             args.embed,
             args.distil,
-            args.des, 
-            args.gpt_layers,
+            args.des,
             ii)
 
         exp = Exp(args)  # set experiments

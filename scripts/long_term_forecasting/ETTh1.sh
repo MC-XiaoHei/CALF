@@ -3,8 +3,8 @@ export CUDA_VISIBLE_DEVICES=0
 seq_len=96
 model=CALF
 
-
-for pred_len in 720
+# 遍历不同的预测长度
+for pred_len in 96 192 336 720
 do
 
 python run.py \
@@ -21,19 +21,17 @@ python run.py \
     --learning_rate 0.0005 \
     --lradj type1 \
     --train_epochs 100 \
-    --d_model 768 \
+    --d_model 128 \
     --n_heads 4 \
     --d_ff 768 \
     --dropout 0.3 \
     --enc_in 7 \
     --c_out 7 \
-    --gpt_layer 6 \
     --itr 1 \
     --model $model \
-    --r 8 \
-    --lora_alpha 32 \
-    --lora_dropout 0.1 \
-    --patience 10
+    --patience 10 \
+    --vit_path google/vit-base-patch16-224-in21k \
+    --gpt_path gpt2
 
 echo '====================================================================================================================='
 done
